@@ -356,8 +356,6 @@ def setup_gradio():
 	voice_list = get_voice_list()
 	result_voices = get_voice_list(args.results_folder)
 	
-	valle_models = get_valle_models()
-
 	autoregressive_models = get_autoregressive_models()
 	diffusion_models = get_diffusion_models()
 	tokenizer_jsons = get_tokenizer_jsons()
@@ -659,10 +657,6 @@ def setup_gradio():
 					EXEC_SETTINGS['results_folder'] = gr.Textbox(label="Results Folder", value=args.results_folder)
 					# EXEC_SETTINGS['tts_backend'] = gr.Dropdown(TTSES, label="TTS Backend", value=args.tts_backend if args.tts_backend else TTSES[0])
 					
-				if args.tts_backend=="vall-e":
-					with gr.Column():
-						EXEC_SETTINGS['valle_model'] = gr.Dropdown(choices=valle_models, label="VALL-E Model Config", value=args.valle_model if args.valle_model else valle_models[0])
-
 				with gr.Column(visible=args.tts_backend=="tortoise"):
 					EXEC_SETTINGS['autoregressive_model'] = gr.Dropdown(choices=["auto"] + autoregressive_models, label="Autoregressive Model", value=args.autoregressive_model if args.autoregressive_model else "auto")
 					EXEC_SETTINGS['diffusion_model'] = gr.Dropdown(choices=diffusion_models, label="Diffusion Model", value=args.diffusion_model if args.diffusion_model else diffusion_models[0])
