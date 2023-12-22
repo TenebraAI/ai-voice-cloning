@@ -41,6 +41,7 @@ from tortoise.api import TextToSpeech as TorToise_TTS, MODELS, get_model_path, p
 from tortoise.utils.audio import load_audio, load_voice, load_voices, get_voice_dir, get_voices
 from tortoise.utils.text import split_and_recombine_text
 from tortoise.utils.device import get_device_name, set_device_name, get_device_count, get_device_vram, get_device_batch_size, do_gc
+from tortoise.utils.tokenizer import DEFAULT_VOCAB_FILE as TOKENIZER_JSON_PATH
 
 
 MODELS['dvae.pth'] = "https://huggingface.co/jbetker/tortoise-tts-v2/resolve/3704aea61678e7e468a06d8eea121dba368a798e/.models/dvae.pth"
@@ -2282,7 +2283,7 @@ def get_diffusion_models(dir="./models/finetunes/", prefixed=False):
 
 def get_tokenizer_jsons( dir="./models/tokenizers/" ):
 	additionals = sorted([ f'{dir}/{d}' for d in os.listdir(dir) if d[-5:] == ".json" ]) if os.path.isdir(dir) else []
-	return relative_paths([ "./modules/tortoise-tts/tortoise/data/tokenizer.json" ] + additionals)
+	return relative_paths([ TOKENIZER_JSON_PATH ] + additionals)
 
 def tokenize_text( text, config=None, stringed=True, skip_specials=False ):
 	from tortoise.utils.tokenizer import VoiceBpeTokenizer
