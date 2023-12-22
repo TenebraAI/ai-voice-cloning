@@ -9,7 +9,7 @@ more-itertools==10.1.0
 music-tag==0.4.3
 openai-whisper==20231117
 phonemizer==3.2.1
-psutil==5.9.5
+psutil==5.9.7
 pydantic==1.10.11
 pykakasi==2.2.1
 voicefixer==0.1.3
