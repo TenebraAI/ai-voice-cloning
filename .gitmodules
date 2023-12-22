@@ -1,6 +1,3 @@
-[submodule "tortoise-tts"]
-	path = modules/tortoise-tts
-	url = https://github.com/TenebraAI/tortoise-tts
 [submodule "dlas"]
 	path = modules/dlas
 	url = https://github.com/TenebraAI/DL-Art-School
