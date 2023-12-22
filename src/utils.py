@@ -653,6 +653,9 @@ def generate_tortoise(**kwargs):
 	stats = [
 		[ parameters['seed'], "{:.3f}".format(info['time']) ]
 	]
+	print(parameters)
+	print(settings)
+	print(args)
 
 	return (
 		sample_voice,
