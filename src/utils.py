@@ -261,6 +261,405 @@ def compute_latents(voice=None, voice_samples=None, voice_latents_chunks=0, orig
 
 	return conditioning_latents
 
+def generate_tortoise(**kwargs):
+	parameters = {}
+	parameters.update(kwargs)
+
+	voice = parameters['voice']
+	progress = parameters['progress'] if 'progress' in parameters else None
+	if parameters['seed'] == 0:
+		parameters['seed'] = None
+
+	usedSeed = parameters['seed']
+
+	global args
+	global tts
+
+	unload_whisper()
+	unload_voicefixer()
+
+	if not tts:
+		# should check if it's loading or unloaded, and load it if it's unloaded
+		if tts_loading:
+			raise Exception("TTS is still initializing...")
+		load_tts()
+	if hasattr(tts, "loading") and tts.loading:
+		raise Exception("TTS is still initializing...")
+
+	do_gc()
+
+	voice_samples = None
+	conditioning_latents = None
+	sample_voice = None
+
+	voice_cache = {}
+	def fetch_voice( voice ):
+		cache_key = f'{voice}:{tts.autoregressive_model_hash[:8]}'
+		if cache_key in voice_cache:
+			return voice_cache[cache_key]
+
+		print(f"Loading voice: {voice} with model {tts.autoregressive_model_hash[:8]}")
+		sample_voice = None
+		if voice == "microphone":
+			if parameters['mic_audio'] is None:
+				raise Exception("Please provide audio from mic when choosing `microphone` as a voice input")
+			voice_samples, conditioning_latents = [load_audio(parameters['mic_audio'], tts.input_sample_rate)], None
+		elif voice == "random":
+			voice_samples, conditioning_latents = None, tts.get_random_conditioning_latents()
+		else:
+			if progress is not None:
+				notify_progress(f"Loading voice: {voice}", progress=progress)
+
+			voice_samples, conditioning_latents = load_voice(voice, model_hash=tts.autoregressive_model_hash)
+			
+		if voice_samples and len(voice_samples) > 0:
+			if conditioning_latents is None:
+				conditioning_latents = compute_latents(voice=voice, voice_samples=voice_samples, voice_latents_chunks=parameters['voice_latents_chunks'])
+				
+			sample_voice = torch.cat(voice_samples, dim=-1).squeeze().cpu()
+			voice_samples = None
+
+		voice_cache[cache_key] = (voice_samples, conditioning_latents, sample_voice)
+		return voice_cache[cache_key]
+
+	def get_settings( override=None ):
+		settings = {
+			'temperature': float(parameters['temperature']),
+
+			'top_p': float(parameters['top_p']),
+			'diffusion_temperature': float(parameters['diffusion_temperature']),
+			'length_penalty': float(parameters['length_penalty']),
+			'repetition_penalty': float(parameters['repetition_penalty']),
+			'cond_free_k': float(parameters['cond_free_k']),
+
+			'num_autoregressive_samples': parameters['num_autoregressive_samples'],
+			'sample_batch_size': args.sample_batch_size,
+			'diffusion_iterations': parameters['diffusion_iterations'],
+
+			'voice_samples': None,
+			'conditioning_latents': None,
+
+			'use_deterministic_seed': parameters['seed'],
+			'return_deterministic_state': True,
+			'k': parameters['candidates'],
+			'diffusion_sampler': parameters['diffusion_sampler'],
+			'breathing_room': parameters['breathing_room'],
+			'half_p': "Half Precision" in parameters['experimentals'],
+			'cond_free': "Conditioning-Free" in parameters['experimentals'],
+			'cvvp_amount': parameters['cvvp_weight'],
+			
+			'autoregressive_model': args.autoregressive_model,
+			'diffusion_model': args.diffusion_model,
+			'tokenizer_json': args.tokenizer_json,
+		}
+
+		# could be better to just do a ternary on everything above, but i am not a professional
+		selected_voice = voice
+		if override is not None:
+			if 'voice' in override:
+				selected_voice = override['voice']
+
+			for k in override:
+				if k not in settings:
+					continue
+				settings[k] = override[k]
+
+		if settings['autoregressive_model'] is not None:
+			if settings['autoregressive_model'] == "auto":
+				settings['autoregressive_model'] = deduce_autoregressive_model(selected_voice)
+			tts.load_autoregressive_model(settings['autoregressive_model'])
+
+		if settings['diffusion_model'] is not None:
+			if settings['diffusion_model'] == "auto":
+				settings['diffusion_model'] = deduce_diffusion_model(selected_voice)
+			tts.load_diffusion_model(settings['diffusion_model'])
+		
+		if settings['tokenizer_json'] is not None:
+			tts.load_tokenizer_json(settings['tokenizer_json'])
+
+		settings['voice_samples'], settings['conditioning_latents'], _ = fetch_voice(voice=selected_voice)
+
+		# clamp it down for the insane users who want this
+		# it would be wiser to enforce the sample size to the batch size, but this is what the user wants
+		settings['sample_batch_size'] = args.sample_batch_size
+		if not settings['sample_batch_size']:
+			settings['sample_batch_size'] = tts.autoregressive_batch_size
+		if settings['num_autoregressive_samples'] < settings['sample_batch_size']:
+			settings['sample_batch_size'] = settings['num_autoregressive_samples']
+
+		if settings['conditioning_latents'] is not None and len(settings['conditioning_latents']) == 2 and settings['cvvp_amount'] > 0:
+			print("Requesting weighing against CVVP weight, but voice latents are missing some extra data. Please regenerate your voice latents with 'Slimmer voice latents' unchecked.")
+			settings['cvvp_amount'] = 0
+			
+		return settings
+
+	if not parameters['delimiter']:
+		parameters['delimiter'] = "\n"
+	elif parameters['delimiter'] == "\\n":
+		parameters['delimiter'] = "\n"
+
+	if parameters['delimiter'] and parameters['delimiter'] != "" and parameters['delimiter'] in parameters['text']:
+		texts = parameters['text'].split(parameters['delimiter'])
+	else:
+		texts = split_and_recombine_text(parameters['text'])
+ 
+	full_start_time = time.time()
+ 
+	outdir = f"{args.results_folder}/{voice}/"
+	os.makedirs(outdir, exist_ok=True)
+
+	audio_cache = {}
+
+	volume_adjust = torchaudio.transforms.Vol(gain=args.output_volume, gain_type="amplitude") if args.output_volume != 1 else None
+
+	idx = 0
+	idx_cache = {}
+	for i, file in enumerate(os.listdir(outdir)):
+		filename = os.path.basename(file)
+		extension = os.path.splitext(filename)[-1][1:]
+		if extension != "json" and extension != "wav":
+			continue
+		match = re.findall(rf"^{voice}_(\d+)(?:.+?)?{extension}$", filename)
+		if match and len(match) > 0:
+			key = int(match[0])
+			idx_cache[key] = True
+
+	if len(idx_cache) > 0:
+		keys = sorted(list(idx_cache.keys()))
+		idx = keys[-1] + 1
+
+	idx = pad(idx, 4)
+
+	def get_name(line=0, candidate=0, combined=False):
+		name = f"{idx}"
+		if combined:
+			name = f"{name}_combined"
+		elif len(texts) > 1:
+			name = f"{name}_{line}"
+		if parameters['candidates'] > 1:
+			name = f"{name}_{candidate}"
+		return name
+
+	def get_info( voice, settings = None, latents = True ):
+		info = {}
+		info.update(parameters)
+
+		info['time'] = time.time()-full_start_time
+		info['datetime'] = datetime.now().isoformat()
+
+		info['model'] = tts.autoregressive_model_path
+		info['model_hash'] = tts.autoregressive_model_hash 
+
+		info['progress'] = None
+		del info['progress']
+
+		if info['delimiter'] == "\n":
+			info['delimiter'] = "\\n"
+
+		if settings is not None:
+			for k in settings:
+				if k in info:
+					info[k] = settings[k]
+
+			if 'half_p' in settings and 'cond_free' in settings:
+				info['experimentals'] = []
+				if settings['half_p']:
+					info['experimentals'].append("Half Precision")
+				if settings['cond_free']:
+					info['experimentals'].append("Conditioning-Free")
+
+		if latents and "latents" not in info:
+			voice = info['voice']
+			model_hash = settings["model_hash"][:8] if settings is not None and "model_hash" in settings else tts.autoregressive_model_hash[:8]
+
+			dir = f'{get_voice_dir()}/{voice}/'
+			latents_path = f'{dir}/cond_latents_{model_hash}.pth'
+
+			if voice == "random" or voice == "microphone":
+				if latents and settings is not None and settings['conditioning_latents']:
+					os.makedirs(dir, exist_ok=True)
+					torch.save(conditioning_latents, latents_path)
+
+			if latents_path and os.path.exists(latents_path):
+				try:
+					with open(latents_path, 'rb') as f:
+						info['latents'] = base64.b64encode(f.read()).decode("ascii")
+				except Exception as e:
+					pass
+
+		return info
+
+	INFERENCING = True
+	for line, cut_text in enumerate(texts):
+		if should_phonemize():
+			cut_text = phonemizer( cut_text )
+
+		if parameters['emotion'] == "Custom":
+			if parameters['prompt'] and parameters['prompt'].strip() != "":
+				cut_text = f"[{parameters['prompt']},] {cut_text}"
+		elif parameters['emotion'] != "None" and parameters['emotion']:
+			cut_text = f"[I am really {parameters['emotion'].lower()},] {cut_text}"
+		
+		tqdm_prefix = f'[{str(line+1)}/{str(len(texts))}]'
+		print(f"{tqdm_prefix} Generating line: {cut_text}")
+		start_time = time.time()
+
+		# do setting editing
+		match = re.findall(r'^(\{.+\}) (.+?)$', cut_text) 
+		override = None
+		if match and len(match) > 0:
+			match = match[0]
+			try:
+				override = json.loads(match[0])
+				cut_text = match[1].strip()
+			except Exception as e:
+				raise Exception("Prompt settings editing requested, but received invalid JSON")
+
+		settings = get_settings( override=override )
+		gen, additionals = tts.tts(cut_text, **settings )
+
+		parameters['seed'] = additionals[0]
+		run_time = time.time()-start_time
+		print(f"Generating line took {run_time} seconds")
+
+		if not isinstance(gen, list):
+			gen = [gen]
+
+		for j, g in enumerate(gen):
+			audio = g.squeeze(0).cpu()
+			name = get_name(line=line, candidate=j)
+
+			settings['text'] = cut_text
+			settings['time'] = run_time
+			settings['datetime'] = datetime.now().isoformat()
+			if args.tts_backend == "tortoise":
+				settings['model'] = tts.autoregressive_model_path
+				settings['model_hash'] = tts.autoregressive_model_hash
+
+			audio_cache[name] = {
+				'audio': audio,
+				'settings': get_info(voice=override['voice'] if override and 'voice' in override else voice, settings=settings)
+			}
+			# save here in case some error happens mid-batch
+			torchaudio.save(f'{outdir}/{cleanup_voice_name(voice)}_{name}.wav', audio, tts.output_sample_rate)
+
+	del gen
+	do_gc()
+	INFERENCING = False
+
+	for k in audio_cache:
+		audio = audio_cache[k]['audio']
+
+		audio, _ = resample(audio, tts.output_sample_rate, args.output_sample_rate)
+		if volume_adjust is not None:
+			audio = volume_adjust(audio)
+
+		audio_cache[k]['audio'] = audio
+		torchaudio.save(f'{outdir}/{cleanup_voice_name(voice)}_{k}.wav', audio, args.output_sample_rate)
+
+	output_voices = []
+	for candidate in range(parameters['candidates']):
+		if len(texts) > 1:
+			audio_clips = []
+			for line in range(len(texts)):
+				name = get_name(line=line, candidate=candidate)
+				audio = audio_cache[name]['audio']
+				audio_clips.append(audio)
+			
+			name = get_name(candidate=candidate, combined=True)
+			audio = torch.cat(audio_clips, dim=-1)
+			torchaudio.save(f'{outdir}/{cleanup_voice_name(voice)}_{name}.wav', audio, args.output_sample_rate)
+
+			audio = audio.squeeze(0).cpu()
+			audio_cache[name] = {
+				'audio': audio,
+				'settings': get_info(voice=voice),
+				'output': True
+			}
+		else:
+			name = get_name(candidate=candidate)
+			audio_cache[name]['output'] = True
+
+
+	if args.voice_fixer:
+		if not voicefixer:
+			notify_progress("Loading voicefix...", progress=progress)
+			load_voicefixer()
+
+		try:
+			fixed_cache = {}
+			for name in tqdm(audio_cache, desc="Running voicefix..."):
+				del audio_cache[name]['audio']
+				if 'output' not in audio_cache[name] or not audio_cache[name]['output']:
+					continue
+
+				path = f'{outdir}/{cleanup_voice_name(voice)}_{name}.wav'
+				fixed = f'{outdir}/{cleanup_voice_name(voice)}_{name}_fixed.wav'
+				voicefixer.restore(
+					input=path,
+					output=fixed,
+					cuda=get_device_name() == "cuda" and args.voice_fixer_use_cuda,
+					#mode=mode,
+				)
+				
+				fixed_cache[f'{name}_fixed'] = {
+					'settings': audio_cache[name]['settings'],
+					'output': True
+				}
+				audio_cache[name]['output'] = False
+			
+			for name in fixed_cache:
+				audio_cache[name] = fixed_cache[name]
+		except Exception as e:
+			print(e)
+			print("\nFailed to run Voicefixer")
+
+	for name in audio_cache:
+		if 'output' not in audio_cache[name] or not audio_cache[name]['output']:
+			if args.prune_nonfinal_outputs:
+				audio_cache[name]['pruned'] = True
+				os.remove(f'{outdir}/{cleanup_voice_name(voice)}_{name}.wav')
+			continue
+
+		output_voices.append(f'{outdir}/{cleanup_voice_name(voice)}_{name}.wav')
+
+		if not args.embed_output_metadata:
+			with open(f'{outdir}/{cleanup_voice_name(voice)}_{name}.json', 'w', encoding="utf-8") as f:
+				f.write(json.dumps(audio_cache[name]['settings'], indent='\t') )
+
+	if args.embed_output_metadata:
+		for name in tqdm(audio_cache, desc="Embedding metadata..."):
+			if 'pruned' in audio_cache[name] and audio_cache[name]['pruned']:
+				continue
+
+			metadata = music_tag.load_file(f"{outdir}/{cleanup_voice_name(voice)}_{name}.wav")
+			metadata['lyrics'] = json.dumps(audio_cache[name]['settings'])
+			metadata.save()
+ 
+	if sample_voice is not None:
+		sample_voice = (tts.input_sample_rate, sample_voice.numpy())
+
+	info = get_info(voice=voice, latents=False)
+	print(f"Generation took {info['time']} seconds, saved to '{output_voices[0]}'\n")
+
+	info['seed'] = usedSeed
+	if 'latents' in info:
+		del info['latents']
+
+	os.makedirs('./config/', exist_ok=True)
+	with open(f'./config/generate.json', 'w', encoding="utf-8") as f:
+		f.write(json.dumps(info, indent='\t') )
+
+	stats = [
+		[ parameters['seed'], "{:.3f}".format(info['time']) ]
+	]
+
+	return (
+		sample_voice,
+		output_voices,
+		stats,
+	)
+
 # superfluous, but it cleans up some things
 class TrainingState():
 	def __init__(self, config_path, keep_x_past_checkpoints=0, start=True):
